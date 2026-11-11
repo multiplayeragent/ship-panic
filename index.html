@@ -1,0 +1,803 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ship Panic</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none; background: #0b0e2a; }
+  body { font: 15px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #eef1ff; user-select: none; -webkit-user-select: none; }
+  canvas { position: fixed; left: 0; top: 0; display: block; width: 100vw; height: 100vh; height: 100dvh; touch-action: none; }
+  [hidden] { display: none !important; }
+  .hud { position: fixed; pointer-events: none; text-shadow: 0 1px 3px #000c; }
+  #net { bottom: max(4px, env(safe-area-inset-bottom)); left: max(10px, env(safe-area-inset-left)); font-size: 12px; opacity: .7; }
+  #name { position: fixed; top: max(8px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right)); width: 110px; height: 36px; border-radius: 10px; border: 1px solid #ffffff33; background: #0008; color: #fff; padding: 0 10px; font: inherit; font-size: 16px; box-sizing: border-box; }
+  .over { position: fixed; inset: 0; display: grid; place-items: center; background: #060824d0; padding: 10px; box-sizing: border-box; z-index: 10; }
+  .card { width: min(380px, calc(100vw - 32px)); max-height: 100%; overflow: auto; box-sizing: border-box; display: flex; flex-direction: column; gap: 8px; padding: 18px; border-radius: 18px; background: #161a44; border: 1px solid #ffffff22; box-shadow: 0 20px 60px #0008; text-align: center; }
+  .card h2 { margin: 0; font-size: 28px; color: #ff6b6b; } .card h3 { margin: 4px 0 0; font-size: 13px; color: #ffd23f; text-align: left; }
+  #oWhy, #oNext { color: #aab0d8; } #oYou { color: #ffd23f; font-weight: 700; }
+  #board { text-align: left; margin: 2px 0; padding-left: 26px; font-size: 14px; min-height: 30px; } #board li span { float: right; }
+  .go { min-height: 46px; border: 0; border-radius: 12px; background: #ffd23f; color: #2a1d00; font: 800 16px system-ui, sans-serif; cursor: pointer; }
+</style>
+<script src="https://cdn.multiplayeragent.com/sdk/mp.global.js"></script>
+</head>
+<body>
+<canvas id="game"></canvas>
+<input id="name" maxlength="14" autocomplete="off" aria-label="Your name">
+<div class="hud" id="net">Connecting…</div>
+<div class="over" id="over" hidden><div class="card">
+  <h2>The ship fell apart!</h2><div id="oWhy"></div><div id="oYou"></div>
+  <h3>Most fixes in one flight</h3><ol id="board"><li>Loading…</li></ol>
+  <button class="go" id="again">Play again</button><div id="oNext"></div>
+</div></div>
+<script>
+/* ═══ SHIP PANIC · a Multiplayer Agent starter ══════════════════════════════════════════════
+ * Shout the orders. Flip the switches. Keep the ship in one piece. Co-op, 2–6 players.
+ * Your screen shows orders for OTHER people's panels; theirs show orders for yours.
+ *
+ * WHERE THINGS ARE (search for the "── " headers):
+ *   CONFIG ........ every number worth tuning: order time, hull damage, levels, bots
+ *   PARTS ......... the silly part names, the four kinds of control, how orders are worded
+ *   CONNECTION .... MP_CONNECT, joining, the offline room, who is host
+ *   PANELS ........ every seat's panel, made from the level's seed (the same on every screen)
+ *   GAME (HOST) ... levels (ready, play, warp, over), seats, making orders and routing them to
+ *                   someone else's screen, checking them, hull damage, taking over as host
+ *   BOTS (HOST) ... bots shout the orders on their screens and work their own panels
+ *   ME ............ my panel values, flipping, turning, sliding, pressing, shouting
+ *   DRAW .......... space window, crew and bubbles, the order screen, the controls
+ *   SCREENS ....... HUD, results, leaderboard, sounds
+ *   INPUT ......... tap or click controls, drag sliders, Space to shout
+ *
+ * HOW THE MULTIPLAYER WORKS (a relay room: no server code):
+ *   - Each player writes its OWN entity: `n`, `c` (name, color), `hb` (heartbeat) once a
+ *     second, and `ctl` = {k, v}: the values of the controls on its own panel (k says which
+ *     level and seat the values are for). Only you can touch your panel.
+ *   - The HOST is the lowest sessionId among live players, worked out every frame. Only the
+ *     host writes shared fields: `game` (ONE JSON field: phase, level, seed, the seats, the
+ *     hull, every open order with its timestamps, the bots' panel values, the score; `v` goes
+ *     up on every write) and `shouts` (the last few things shouted).
+ *   - The host makes each order for a control on one seat's panel and shows it on a DIFFERENT
+ *     seat's screen. It reads every panel (entities for people, `game.bots` for bots) and
+ *     marks an order fixed when its control matches. Late: the hull takes damage.
+ *   - Intents to the host: "shout" (read my order out loud to the crew), "ready".
+ *   - Panels come from game.seed with a seeded PRNG, so every screen builds the same ones.
+ *   - Someone leaves: a bot takes their seat with their panel. Someone joins: they take a
+ *     bot's seat. A new host carries on from state; order timers are timestamps.
+ *   - ?attract plays offline with bots, your seat on autopilot (the preview video).
+ *   - Leaderboard "fixes": the most orders the crew fixed in one flight.
+ */
+
+// ── CONFIG ──────────────────────────────────────────────────────────────────────────
+const CONFIG = {
+  seats: 4,               // bots fill the crew up to this many seats
+  maxSeats: 6,            // more players than this wait for the next level
+  controls: [4, 5, 6],    // controls per panel at level 1, 2, 3+
+  orderMs: 13000,         // time to fix an order at level 1…
+  orderFaster: 1300,      // …this much less per level…
+  minOrderMs: 5500,       // …but never less than this
+  needBase: 10,           // fixes to warp out of level 1…
+  needPerLevel: 3,        // …and this many more each level
+  hullHit: 12,            // hull lost per missed order (out of 100)
+  hullRepair: 20,         // hull repaired at each warp
+  readyMs: 3500,          // look at your new panel before the orders start
+  warpMs: 3800,           // the warp between levels
+  overMs: 15000,          // results screen
+  doneShowMs: 900,        // a fixed (or missed) order stays on screen this long
+  nextOrderMs: [300, 1400], // then a new one appears after this long
+  leaveMs: 6000,          // a player silent this long hands their seat to a bot
+  botShoutMs: [700, 1800],  // a bot shouts the order on its screen after this long
+  botHeardMs: [1300, 3200], // a bot fixes its control this long after hearing it shouted
+  botUnheardMs: [5500, 15000], // …or, if nobody shouted it, maybe this long after (it overheard)
+  botMiss: 0.1,           // chance a bot doesn't react at all
+  botFiddle: 0.25,        // bot fidgets with a spare control: chance per second, per bot
+  shoutLines: 6,          // shouts kept in state
+  board: "fixes",         // leaderboard: orders fixed in one flight
+};
+const BOT_NAMES = ["Zib", "Kip", "Moxie", "Blip", "Nova", "Pog", "Tink", "Rook"];
+const FRIENDLY = ["Captain", "Pilot", "Cadet", "Ensign", "Rookie", "Ace", "Chief", "Skipper"];
+const COLORS = ["#ff5d73", "#3ec1ff", "#ffd23f", "#4bf08a", "#c38bff", "#ff9f43", "#5ef0e0", "#ff8fd1"];
+
+// ── PARTS ───────────────────────────────────────────────────────────────────────────
+// Part names are WORD1 + WORD2, picked by the level's seed. Add words to get new parts.
+const WORD1 = ["Flux", "Gravy", "Quantum", "Noodle", "Blorp", "Turbo", "Wobble", "Plasma", "Snorkel", "Fizzy", "Hyper", "Gloop",
+  "Zorp", "Mega", "Spork", "Jelly", "Rocket", "Bleep", "Squid", "Cosmic", "Pickle", "Nebula", "Twinkle", "Grumble"];
+const WORD2 = ["Wobbler", "Tube", "Spatula", "Throttle", "Valve", "Beacon", "Lever", "Crank", "Gasket", "Sprocket", "Toggle", "Whisk",
+  "Coil", "Nozzle", "Funnel", "Dongle", "Flange", "Booster", "Gizmo", "Plunger", "Ladle", "Siphon", "Bellows", "Gubbins"];
+// The four kinds of control. `max`: values run 0..max. `say(name, val)`: how an order is worded.
+const KINDS = {
+  switch: { max: 1, say: (n, v) => `Turn ${v ? "ON" : "OFF"} the ${n}!` },
+  dial:   { max: 4, say: (n, v) => `Set the ${n} to ${v}!` },
+  slider: { max: 5, say: (n, v) => `Push the ${n} to ${v}!` },
+  button: { max: 0, say: (n) => `Press the ${n}!` }, // its value counts presses
+};
+const KIND_LIST = ["switch", "dial", "slider", "button", "dial", "switch"];
+
+// ── CONNECTION ──────────────────────────────────────────────────────────────────────
+// The builder fills these in for this game. Downloaded from GitHub? Put your own pk_ key here.
+const MP_CONNECT = {
+  key: 'pk_REPLACE_ME',
+  room: 'ship-panic',
+  endpoint: 'wss://live.multiplayeragent.com',
+  apiUrl: 'https://api.multiplayeragent.com',
+};
+const ATTRACT = new URLSearchParams(location.search).has("attract");
+
+/** Same shape as the SDK client, kept in this tab: offline play and ?attract. */
+function localRoom() {
+  const id = "local", state = { entities: { players: { [id]: {} } }, shared: {} }, subs = [];
+  let queued = false;
+  const emit = () => { if (!queued) { queued = true; queueMicrotask(() => { queued = false; subs.forEach((f) => f(state)); }); } };
+  const put = (o, k, v) => { if (typeof k === "object") Object.assign(o, k); else o[k] = v; emit(); };
+  return {
+    sessionId: id, state, offline: true,
+    me: { set: (k, v) => put(state.entities.players[id], k, v) },
+    setShared: (k, v) => put(state.shared, k, v),
+    onState: (f) => { subs.push(f); f(state); }, onJoin() {}, onLeave() {}, on() {}, send() {},
+    onDisconnect() {}, onReconnect() {}, leave: async () => {},
+  };
+}
+async function connect() {
+  if (ATTRACT || typeof MP === "undefined") return localRoom();
+  try {
+    const mp = await Promise.race([MP.join({ ...MP_CONNECT }), new Promise((_, no) => setTimeout(() => no(new Error("timed out")), 10000))]);
+    window.mp = mp; // the builder calls window.mp.leave() when the page closes
+    return mp;
+  } catch (e) {
+    console.warn("Playing offline:", e && e.message);
+    return localRoom();
+  }
+}
+const parse = (v, fb) => { if (typeof v !== "string") return fb; try { return JSON.parse(v); } catch { return fb; } };
+const memo = new Map();
+/** A shared JSON field, parsed once per change (read-only: never mutate what this returns). */
+function shared(key, fb) {
+  const raw = S.shared[key], m = memo.get(key);
+  if (m && m.raw === raw) return m.v;
+  const v = parse(raw, fb);
+  memo.set(key, { raw, v });
+  return v;
+}
+let net = null, S = { entities: { players: {} }, shared: {} };
+const seenHb = new Map(); // sessionId -> { hb, at } on OUR clock
+/** Players whose heartbeat moved in the last 3s (plus us), sorted by sessionId. */
+function livePlayers() {
+  const now = performance.now(), out = [];
+  for (const [id, p] of Object.entries(S.entities.players || {})) {
+    const s = seenHb.get(id);
+    if (!s || s.hb !== p.hb) seenHb.set(id, { hb: p.hb, at: now });
+    if (id === net.sessionId || now - seenHb.get(id).at < 3000) out.push(id);
+  }
+  return out.sort();
+}
+let frameAt = 0, wokeAt = -1e9; // my loop's last frame, and when it last woke from a stall (a frozen or background tab)
+/** Never while my own loop is stalled, nor for 0.7s after it wakes: the room moved on without me, so the newer state lands first. */
+const isHost = () => livePlayers()[0] === net.sessionId && performance.now() - frameAt < 1000 && performance.now() - wokeAt > 700;
+const humans = () => livePlayers();
+const stillHere = (id) => id === net.sessionId || (!!S.entities.players?.[id] && performance.now() - (seenHb.get(id)?.at ?? -1e9) < CONFIG.leaveMs);
+const nameOf = (id) => (id === net.sessionId ? myName : String(S.entities.players?.[id]?.n ?? "Player")).slice(0, 14);
+const colorOf = (id) => (id === net.sessionId ? myColor : String(S.entities.players?.[id]?.c ?? "#ccc"));
+
+// ── PANELS ──────────────────────────────────────────────────────────────────────────
+function mulberry32(a) { return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+const panelCache = new Map();
+/** Every seat's panel for a level: [{name, kind, start, hue}] per seat, all names different. Same seed, same panels. */
+function panelsFor(seed, seats, lvl) {
+  const key = seed + ":" + seats + ":" + lvl;
+  if (panelCache.has(key)) return panelCache.get(key);
+  const r = mulberry32(seed), n = CONFIG.controls[Math.min(lvl, CONFIG.controls.length) - 1], used = new Set(), out = [];
+  for (let s = 0; s < seats; s++) {
+    const kinds = KIND_LIST.slice(0, n);
+    for (let i = kinds.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [kinds[i], kinds[j]] = [kinds[j], kinds[i]]; }
+    out.push(kinds.map((kind) => {
+      let name;
+      do name = WORD1[Math.floor(r() * WORD1.length)] + " " + WORD2[Math.floor(r() * WORD2.length)]; while (used.has(name));
+      used.add(name);
+      return { name, kind, start: Math.floor(r() * (KINDS[kind].max + 1)), hue: Math.floor(r() * 360) };
+    }));
+  }
+  panelCache.set(key, out);
+  return out;
+}
+const panels = (g) => panelsFor(g.seed, g.crew.length, g.lvl);
+const orderText = (g, o) => { const c = panels(g)[o.t][o.k]; return KINDS[c.kind].say(c.name, o.val); };
+const orderMs = (lvl) => Math.max(CONFIG.minOrderMs, CONFIG.orderMs - CONFIG.orderFaster * (lvl - 1));
+const needFor = (lvl) => CONFIG.needBase + CONFIG.needPerLevel * (lvl - 1);
+const ctlKey = (g, s) => g.id + ":" + g.lvl + ":" + s;
+
+// ── GAME (HOST) ─────────────────────────────────────────────────────────────────────
+// Only the host keeps: when each bot will shout or act, and the last panel values it read from each seat.
+const host = { last: null, was: false, plans: new Map(), seen: new Map(), shouts: { c: 0, l: [] }, nextId: 1, fiddleAt: 0 };
+
+const gameMemo = { raw: undefined, g: null };
+/** The game as state has it, or the host's own newer write that hasn't come back yet. */
+function game() {
+  if (gameMemo.raw !== S.shared.game) { gameMemo.raw = S.shared.game; gameMemo.g = parse(S.shared.game, null); }
+  const g = gameMemo.g;
+  return host.last && isHost() && (!g || host.last.v > g.v) ? host.last : g;
+}
+function writeGame(g) { g = { ...g, v: Math.max(game()?.v ?? 0, host.last?.v ?? 0) + 1 }; host.last = g; net.setShared("game", JSON.stringify(g)); return g; }
+const patch = (changes) => writeGame({ ...game(), ...changes });
+const rnd = (a, b) => a + Math.random() * (b - a);
+const pick = (a) => a[Math.floor(Math.random() * a.length)];
+
+/** A new level: seats for everyone here (bots fill up to CONFIG.seats), new panels, no orders yet. */
+function newLevel(prev, lvl) {
+  const t = Date.now(), hs = humans().slice(0, CONFIG.maxSeats), n = Math.max(CONFIG.seats, hs.length);
+  const crew = hs.map((id) => ({ i: id, n: nameOf(id), c: colorOf(id) }));
+  const used = new Set(crew.map((c) => c.c)), free = COLORS.filter((c) => !used.has(c)), names = [...BOT_NAMES].sort(() => Math.random() - 0.5);
+  for (let k = crew.length; k < n; k++) crew.push({ i: "bot" + k, n: names[k % names.length], c: free[k % Math.max(1, free.length)] || COLORS[k % COLORS.length], b: 1 });
+  const seed = (Math.random() * 2 ** 31) | 0, P = panelsFor(seed, crew.length, lvl);
+  return { id: prev ? (lvl === 1 ? prev.id + 1 : prev.id) : 1, ph: "ready", lvl, seed, crew, at: t, endsAt: t + CONFIG.readyMs,
+    hull: prev && lvl > 1 ? Math.min(100, prev.hull + CONFIG.hullRepair) : 100, prog: 0, need: needFor(lvl), score: prev && lvl > 1 ? prev.score : 0,
+    orders: [], bots: Object.fromEntries(crew.map((c, s) => [s, P[s].map((x) => x.start)])), ready: [], last: "" };
+}
+/** The values on seat s's panel: a bot's from the game, a person's from their entity. */
+function valuesOf(g, s) {
+  const c = g.crew[s];
+  if (!c) return [];
+  if (c.b) return g.bots[s] || [];
+  const ctl = c.i === net.sessionId ? myCtl : parse(S.entities.players?.[c.i]?.ctl, null);
+  if (ctl && ctl.k === ctlKey(g, s) && Array.isArray(ctl.v)) { host.seen.set(s, ctl.v); return ctl.v; }
+  return host.seen.get(s) || g.bots[s] || [];
+}
+
+function hostTick() {
+  if (!host.was) adopt();
+  const t = Date.now();
+  let g = game();
+  if (!g) g = writeGame(newLevel(null, 1));
+  if (g.ph === "ready") { g = seatChanges(g); if (t >= g.endsAt) patch({ ph: "play", at: t }); }
+  else if (g.ph === "play") playTick(seatChanges(g), t);
+  else if (g.ph === "warp" && t >= g.endsAt) writeGame(newLevel(g, g.lvl + 1));
+  else if (g.ph === "over" && t >= g.endsAt) writeGame(newLevel(g, 1));
+}
+/** Check every order, retire old ones, make new ones, let the bots work. */
+function playTick(g, t) {
+  let orders = g.orders, hull = g.hull, prog = g.prog, score = g.score, changed = false, last = g.last;
+  orders = orders.map((o) => {
+    if (o.done) return o;
+    const v = valuesOf(g, o.t)[o.k], kind = panels(g)[o.t][o.k].kind;
+    const fixed = kind === "button" ? v > o.base : v === o.val;
+    if (fixed) { changed = true; prog++; score++; return { ...o, done: 1, doneAt: t }; }
+    if (t >= o.endsAt) { changed = true; hull = Math.max(0, hull - CONFIG.hullHit); last = orderText(g, o); return { ...o, done: -1, doneAt: t }; }
+    return o;
+  });
+  const keep = orders.filter((o) => !o.done || t < o.doneAt + CONFIG.doneShowMs);
+  if (keep.length !== orders.length) changed = true;
+  for (const o of orders) if (!keep.includes(o)) for (const k of ["plan", "act", "shout"]) host.plans.delete(k + o.id); // forget retired orders
+  orders = keep;
+  // every seat's screen gets a new order a moment after its last one is gone
+  for (let s = 0; s < g.crew.length; s++) {
+    if (orders.some((o) => o.s === s)) continue;
+    if (!host.plans.has("free" + s)) host.plans.set("free" + s, t + rnd(...CONFIG.nextOrderMs));
+    if (t < host.plans.get("free" + s)) continue;
+    host.plans.delete("free" + s);
+    const o = makeOrder({ ...g, orders }, s, t);
+    if (o) { orders = [...orders, o]; changed = true; }
+  }
+  if (hull <= 0) { const at = Date.now(); writeGame({ ...g, orders: [], hull: 0, score, prog, last, ph: "over", at, endsAt: at + CONFIG.overMs, ready: [] }); return; }
+  if (prog >= g.need) { const at = Date.now(); writeGame({ ...g, orders: [], hull, score, prog, last, ph: "warp", at, endsAt: at + CONFIG.warpMs }); return; }
+  if (changed) g = writeGame({ ...g, orders, hull, prog, score, last });
+  botsTick(g, t);
+}
+/** An order for screen s: a control on someone else's panel that isn't already ordered, set to a new value. */
+function makeOrder(g, s, t) {
+  const P = panels(g), others = g.crew.map((_, i) => i).filter((i) => i !== s);
+  if (!others.length) return null;
+  const people = others.filter((i) => !g.crew[i].b);
+  const taken = new Set(g.orders.filter((o) => !o.done).map((o) => o.t + ":" + o.k));
+  for (let tries = 0; tries < 20; tries++) {
+    const tgt = g.crew[s].b && people.length && Math.random() < 0.6 ? pick(people) : pick(others); // bots send people work
+    const k = Math.floor(Math.random() * P[tgt].length), c = P[tgt][k];
+    if (taken.has(tgt + ":" + k)) continue;
+    const cur = valuesOf(g, tgt)[k] ?? 0, max = KINDS[c.kind].max;
+    let val = c.kind === "button" ? 0 : Math.floor(Math.random() * (max + 1));
+    if (c.kind !== "button" && val === cur) val = (cur + 1 + Math.floor(Math.random() * max)) % (max + 1);
+    return { id: host.nextId++ + "-" + (t % 100000), s, t: tgt, k, val, base: c.kind === "button" ? cur : 0, at: t, endsAt: t + orderMs(g.lvl), done: 0 };
+  }
+  return null;
+}
+/** Someone left: a bot takes their seat and panel. Someone new: they take a bot's seat. */
+function seatChanges(g) {
+  let crew = g.crew, bots = g.bots, changed = false;
+  crew = crew.map((c, s) => {
+    if (c.b || stillHere(c.i)) return c;
+    changed = true; bots = { ...bots, [s]: [...valuesOf(g, s)] };
+    return { i: "bot" + s, n: pick(BOT_NAMES), c: c.c, b: 1 };
+  });
+  for (const id of humans()) {
+    if (crew.some((c) => c.i === id) || !S.entities.players?.[id]) continue;
+    const s = crew.findIndex((c) => c.b);
+    if (s < 0) break;
+    changed = true; host.seen.set(s, bots[s]);
+    crew = crew.map((c, i) => (i === s ? { i: id, n: nameOf(id), c: c.c } : c));
+  }
+  return changed ? patch({ crew, bots }) : g;
+}
+/** Become host: carry on exactly as state has it. */
+function adopt() {
+  host.was = true; host.last = null; host.plans = new Map(); host.seen = new Map();
+  host.shouts = shared("shouts", null) || { c: 0, l: [] };
+}
+/** Read an order out loud to the crew: it shows as a speech bubble over the seat that shouted. */
+function onShout(from, msg) {
+  const g = game();
+  if (!g || g.ph !== "play" || !msg) return;
+  const s = g.crew.findIndex((c) => c.i === from), o = g.orders.find((x) => x.id === msg.o && x.s === s && !x.done);
+  if (s < 0 || !o) return;
+  shout(g, s, o);
+}
+function shout(g, s, o) {
+  const last = host.plans.get("shout" + o.id);
+  if (last && Date.now() - last < 1500) return;
+  host.plans.set("shout" + o.id, Date.now());
+  host.shouts = { c: host.shouts.c + 1, l: [...host.shouts.l, [s, orderText(g, o), o.id]].slice(-CONFIG.shoutLines) };
+  net.setShared("shouts", JSON.stringify(host.shouts));
+  if (g.crew[o.t]?.b) heard(o, true);
+}
+function onReady(from) {
+  const g = game();
+  if (!g || g.ph !== "over" || g.ready.includes(from)) return;
+  const ready = [...g.ready, from], all = humans().every((id) => ready.includes(id));
+  patch({ ready, endsAt: all ? Math.min(g.endsAt, Date.now() + 1200) : g.endsAt });
+}
+const HANDLERS = { shout: onShout, ready: onReady };
+/** Ask the host to do something. The host's own intents run right here (mp.send never echoes). */
+function toHost(type, msg) { if (isHost()) HANDLERS[type](net.sessionId, msg); else net.send(type, msg); }
+
+// ── BOTS (HOST) ─────────────────────────────────────────────────────────────────────
+/** A bot whose control was named plans when to fix it (or, now and then, forgets). */
+function heard(o, loud) {
+  const key = "act" + o.id, prev = host.plans.get(key);
+  if (prev && (prev.loud || !loud)) return;
+  const miss = Math.random() < CONFIG.botMiss;
+  host.plans.set(key, { at: miss ? Infinity : Date.now() + rnd(...(loud ? CONFIG.botHeardMs : CONFIG.botUnheardMs)), loud });
+}
+function botsTick(g, t) {
+  let bots = g.bots, changed = false;
+  for (const o of g.orders) {
+    if (o.done) continue;
+    if (g.crew[o.s]?.b && !host.plans.has("shout" + o.id)) { // a bot reads its screen out loud
+      const key = "plan" + o.id;
+      if (!host.plans.has(key)) host.plans.set(key, o.at + rnd(...CONFIG.botShoutMs));
+      if (t >= host.plans.get(key)) shout(g, o.s, o);
+    }
+    if (!g.crew[o.t]?.b) continue;
+    if (!host.plans.has("act" + o.id)) heard(o, false);
+    const p = host.plans.get("act" + o.id);
+    if (t < p.at) continue;
+    p.at = Infinity; changed = true;
+    const vals = [...(bots[o.t] || [])];
+    vals[o.k] = panels(g)[o.t][o.k].kind === "button" ? (vals[o.k] || 0) + 1 : o.val;
+    bots = { ...bots, [o.t]: vals };
+  }
+  if (t >= host.fiddleAt) { // bots fidget with controls nobody ordered (it looks busy, and it changes nothing)
+    host.fiddleAt = t + 1000;
+    const busy = new Set(g.orders.filter((o) => !o.done).map((o) => o.t + ":" + o.k));
+    g.crew.forEach((c, s) => {
+      if (!c.b || Math.random() > CONFIG.botFiddle) return;
+      const P = panels(g)[s], k = Math.floor(Math.random() * P.length);
+      if (busy.has(s + ":" + k) || P[k].kind === "button") return;
+      const vals = [...(bots[s] || [])]; vals[k] = Math.floor(Math.random() * (KINDS[P[k].kind].max + 1)); bots = { ...bots, [s]: vals }; changed = true;
+    });
+  }
+  if (changed) patch({ bots });
+}
+
+// ── ME ──────────────────────────────────────────────────────────────────────────────
+let myName = "", myColor = COLORS[0], dropped = false;
+try { myName = localStorage.getItem("mpa-name") || ""; } catch {}
+if (!myName) myName = pick(FRIENDLY) + " " + (10 + Math.floor(Math.random() * 90));
+let myCtl = null; // { k, v }: my panel's values for this level and seat
+const mySeat = (g) => (g ? g.crew.findIndex((c) => c.i === net.sessionId) : -1);
+/** A new level or a new seat: start from the panel as it is (a bot's values if I took its seat). */
+function syncMyPanel(g) {
+  const s = mySeat(g);
+  if (s < 0 || !["ready", "play"].includes(g.ph)) return;
+  if (myCtl && myCtl.k === ctlKey(g, s)) return;
+  myCtl = { k: ctlKey(g, s), v: [...(g.bots[s] || panels(g)[s].map((c) => c.start))] };
+  net.me.set("ctl", JSON.stringify(myCtl));
+}
+/** Change one of my controls: k = which control, v = its new value. */
+function setControl(k, v) {
+  const g = game(), s = mySeat(g);
+  if (!myCtl || s < 0 || g.ph !== "play" && g.ph !== "ready" || myCtl.v[k] === v) return;
+  myCtl = { k: myCtl.k, v: myCtl.v.map((x, i) => (i === k ? v : x)) };
+  net.me.set("ctl", JSON.stringify(myCtl));
+  pressAt.set(s + ":" + k, performance.now());
+  const c = panels(g)[s][k];
+  tone(c.kind === "switch" ? 300 : c.kind === "button" ? 520 : 420 + v * 60, 60, "square", 0.04);
+}
+function myOrder(g) { const s = mySeat(g); return g && s >= 0 ? g.orders.find((o) => o.s === s) : null; }
+function shoutMine() {
+  const g = game(), o = myOrder(g);
+  if (!o || o.done) return;
+  toHost("shout", { o: o.id });
+  shoutPulse = performance.now();
+}
+/** ?attract: my seat plays itself: shout my order, fix my controls when someone shouts them. */
+const auto = { next: 0, shoutFor: "" };
+function autopilot(g, now) {
+  if (!ATTRACT || g.ph !== "play" || now < auto.next) return;
+  auto.next = now + 250;
+  const s = mySeat(g), o = myOrder(g);
+  if (o && !o.done && auto.shoutFor !== o.id && Date.now() > o.at + 700) { auto.shoutFor = o.id; shoutMine(); }
+  for (const x of g.orders) {
+    if (x.done || x.t !== s || Date.now() < x.at + 1400 + (x.id.length % 3) * 300) continue;
+    const kind = panels(g)[s][x.k].kind;
+    setControl(x.k, kind === "button" ? (myCtl.v[x.k] || 0) + 1 : x.val);
+    auto.next = now + 600;
+    break;
+  }
+}
+
+// ── DRAW ────────────────────────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+const cv = $("game"), ctx = cv.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+const L = { top: {}, win: {}, crew: {}, card: {}, panel: {} }; // screen regions, from fit()
+/** Lay out the screen: stacked on phones, two columns on wide screens. */
+function fit() {
+  DPR = Math.min(2, devicePixelRatio || 1); W = innerWidth; H = innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  const sa = 8, wide = W >= 760 && W > H * 1.15, pad = 10;
+  if (wide) {
+    const lw = Math.round(W * 0.47);
+    L.top = { x: pad, y: sa, w: lw - pad * 2, h: 48 };
+    L.win = { x: pad, y: sa + 54, w: lw - pad * 2, h: Math.round(H * 0.26) };
+    L.crew = { x: pad, y: L.win.y + L.win.h + 6, w: lw - pad * 2, h: 92 };
+    L.card = { x: pad, y: L.crew.y + L.crew.h + 8, w: lw - pad * 2, h: H - (L.crew.y + L.crew.h + 8) - 26 };
+    L.panel = { x: lw, y: sa + 48, w: W - lw - pad, h: H - sa - 48 - 22 };
+  } else {
+    L.top = { x: pad, y: sa, w: W - pad * 2 - (ATTRACT ? 0 : 120), h: 48 }; // room for the name box
+    L.win = { x: pad, y: sa + 52, w: W - pad * 2, h: Math.round(Math.max(70, H * 0.1)) };
+    L.crew = { x: pad, y: L.win.y + L.win.h + 4, w: W - pad * 2, h: 84 };
+    L.card = { x: pad, y: L.crew.y + L.crew.h + 6, w: W - pad * 2, h: Math.round(Math.max(118, H * 0.17)) };
+    L.panel = { x: pad, y: L.card.y + L.card.h + 8, w: W - pad * 2, h: H - (L.card.y + L.card.h + 8) - 20 };
+  }
+  if (ATTRACT) $("name").hidden = true;
+}
+addEventListener("resize", fit); addEventListener("orientationchange", fit);
+
+const rr = (x, y, w, h, r) => { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); };
+const circle = (x, y, r) => { ctx.beginPath(); ctx.arc(x, y, Math.max(0.1, r), 0, Math.PI * 2); };
+const ease = (t) => 1 - (1 - Math.min(1, Math.max(0, t))) ** 3;
+const STARS = Array.from({ length: 140 }, () => ({ x: Math.random(), y: Math.random(), z: 0.2 + Math.random() * 0.8 }));
+let HITS = [], warpK = 0, shakeUntil = 0, flashUntil = 0, flashColor = "#ff2a2a", shoutPulse = -1e9;
+const pressAt = new Map(), bubbles = new Map(), parts = [];
+
+/** The view out of the window: stars that streak faster each level, and much faster in a warp. */
+function drawWindow(g, now, dt) {
+  const R = L.win, speed = (0.05 + 0.03 * (g ? g.lvl : 1)) * (1 + warpK * 14);
+  ctx.save(); rr(R.x, R.y, R.w, R.h, 16); ctx.clip();
+  const sky = ctx.createLinearGradient(0, R.y, 0, R.y + R.h); sky.addColorStop(0, "#05061a"); sky.addColorStop(1, "#1a1050"); ctx.fillStyle = sky; ctx.fillRect(R.x, R.y, R.w, R.h);
+  const cx = R.x + R.w / 2, cy = R.y + R.h / 2;
+  for (const s of STARS) {
+    s.z -= speed * dt * s.z; if (s.z <= 0.05) { s.z = 1; s.x = Math.random(); s.y = Math.random(); }
+    const k = 0.25 / s.z, x = cx + (s.x - 0.5) * R.w * k, y = cy + (s.y - 0.5) * R.h * k * 1.6, len = 1 + warpK * 40 * (1 - s.z) + speed * 30;
+    if (x < R.x || x > R.x + R.w || y < R.y || y > R.y + R.h) { s.z = 1; continue; }
+    const dx = (x - cx) / (Math.hypot(x - cx, y - cy) || 1), dy = (y - cy) / (Math.hypot(x - cx, y - cy) || 1);
+    ctx.strokeStyle = `rgba(220,230,255,${Math.pow(1 - s.z, 0.6)})`; ctx.lineWidth = 1.6 * (1.2 - s.z); ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x - dx * len, y - dy * len); ctx.stroke();
+  }
+  const hurt = g ? 1 - g.hull / 100 : 0; // cracks in the glass as the hull fails
+  if (hurt > 0.25) { ctx.strokeStyle = `rgba(255,255,255,${0.15 + hurt * 0.3})`; ctx.lineWidth = 1.2; ctx.beginPath(); ctx.moveTo(R.x + R.w * 0.8, R.y); ctx.lineTo(R.x + R.w * 0.74, R.y + R.h * 0.4); ctx.lineTo(R.x + R.w * 0.79, R.y + R.h * 0.62); ctx.moveTo(R.x + R.w * 0.74, R.y + R.h * 0.4); ctx.lineTo(R.x + R.w * 0.66, R.y + R.h * 0.5); ctx.stroke(); }
+  if (hurt > 0.6) { ctx.beginPath(); ctx.moveTo(R.x + R.w * 0.1, R.y + R.h); ctx.lineTo(R.x + R.w * 0.18, R.y + R.h * 0.55); ctx.lineTo(R.x + R.w * 0.26, R.y + R.h * 0.42); ctx.stroke(); }
+  ctx.restore();
+  ctx.strokeStyle = "#3a4290"; ctx.lineWidth = 4; rr(R.x, R.y, R.w, R.h, 16); ctx.stroke();
+}
+/** The top bar: hull, level and how close the warp is. */
+function drawTop(g, now) {
+  const R = L.top, hw = Math.min(R.w * 0.42, 260), lowHull = g.hull < 35 && Math.floor(now / 300) % 2 === 0;
+  ctx.font = "800 12px system-ui, sans-serif"; ctx.textAlign = "left"; ctx.textBaseline = "middle"; ctx.fillStyle = "#9fa8ff"; ctx.fillText("HULL", R.x, R.y + 12);
+  ctx.fillStyle = "#1a1f4a"; rr(R.x, R.y + 22, hw, 16, 8); ctx.fill();
+  const hc = g.hull > 60 ? "#4bf08a" : g.hull > 30 ? "#ffd23f" : "#ff4b4b";
+  ctx.fillStyle = lowHull ? "#ffffff" : hc; rr(R.x, R.y + 22, Math.max(8, (hw * g.hull) / 100), 16, 8); ctx.fill();
+  ctx.fillStyle = "#0b0e2a"; ctx.font = "900 11px system-ui, sans-serif"; ctx.fillText(Math.round(g.hull) + "%", R.x + 8, R.y + 30.5);
+  const px = R.x + hw + 16, pw = Math.max(60, R.w - hw - 16);
+  ctx.fillStyle = "#9fa8ff"; ctx.font = "800 12px system-ui, sans-serif"; ctx.fillText(`SECTOR ${g.lvl} · ${Math.min(g.prog, g.need)}/${g.need}`, px, R.y + 12);
+  ctx.fillStyle = "#1a1f4a"; rr(px, R.y + 22, pw, 16, 8); ctx.fill();
+  const grd = ctx.createLinearGradient(px, 0, px + pw, 0); grd.addColorStop(0, "#3ec1ff"); grd.addColorStop(1, "#c38bff");
+  ctx.fillStyle = grd; rr(px, R.y + 22, Math.max(8, (pw * Math.min(g.prog, g.need)) / g.need), 16, 8); ctx.fill();
+}
+/** The crew: a round crewmate per seat, with their latest shout in a bubble. */
+function drawCrew(g, now) {
+  const R = L.crew, n = g.crew.length, me = mySeat(g), sw = R.w / n, r = Math.min(22, sw * 0.26, R.h * 0.27);
+  g.crew.forEach((c, s) => {
+    const x = R.x + sw * (s + 0.5), y = R.y + R.h * 0.42, b = bubbles.get(s), talking = b && now - b.at < 2500;
+    const bob = Math.sin(now / 300 + s * 1.7) * (talking ? 3 : 1.2);
+    ctx.fillStyle = "#0006"; ctx.beginPath(); ctx.ellipse(x, y + r * 1.05, r * 0.9, r * 0.25, 0, 0, 7); ctx.fill();
+    ctx.fillStyle = c.c; circle(x, y + bob, r); ctx.fill();
+    ctx.fillStyle = "#cfe9ff"; rr(x - r * 0.62, y + bob - r * 0.45, r * 1.24, r * 0.6, r * 0.3); ctx.fill(); // visor
+    ctx.fillStyle = "#14183a"; const blink = (now / 1000 + s) % 3.3 < 0.1;
+    for (const d of [-1, 1]) { ctx.beginPath(); ctx.ellipse(x + d * r * 0.25, y + bob - r * 0.15, r * 0.09, blink ? 1 : r * 0.12, 0, 0, 7); ctx.fill(); }
+    if (talking) { ctx.fillStyle = "#14183a"; ctx.beginPath(); ctx.ellipse(x, y + bob + r * 0.4, r * 0.18, r * (0.06 + 0.08 * Math.abs(Math.sin(now / 70))), 0, 0, 7); ctx.fill(); }
+    if (s === me) { ctx.strokeStyle = "#ffd23f"; ctx.lineWidth = 3; circle(x, y + bob, r + 4); ctx.stroke(); }
+    ctx.font = "700 12px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = s === me ? "#ffd23f" : "#dfe3ff"; ctx.fillText(s === me ? "You" : c.n.length > 9 ? c.n.slice(0, 8) + "…" : c.n, x, y + r + 16);
+  });
+  // bubbles last, so they sit on top of everything around them
+  g.crew.forEach((c, s) => {
+    const b = bubbles.get(s), age = b ? now - b.at : 1e9;
+    if (age > 3200) return;
+    const x = R.x + sw * (s + 0.5), y = R.y + R.h * 0.42 - r - 8 - (s % 2) * 10, pop = ease(age / 180), a = age > 2700 ? (3200 - age) / 500 : 1;
+    ctx.font = "800 12px system-ui, sans-serif";
+    const lines = wrap(b.text, Math.max(76, Math.min(170, sw - 14)), 4), bw = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 14, bh = lines.length * 15 + 9;
+    const bx = Math.max(6, Math.min(W - bw - 6, x - bw / 2)), by = y - bh - 6;
+    ctx.save(); ctx.globalAlpha = a; ctx.translate(x, y); ctx.scale(0.6 + 0.4 * pop, 0.6 + 0.4 * pop); ctx.translate(-x, -y);
+    ctx.fillStyle = b.mine ? "#ffd23f" : "#ffffff"; rr(bx, by, bw, bh, 9); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(x - 6, by + bh - 1); ctx.lineTo(x, by + bh + 7); ctx.lineTo(x + 6, by + bh - 1); ctx.fill();
+    ctx.fillStyle = "#14183a"; ctx.textAlign = "left"; lines.forEach((l, i) => ctx.fillText(l, bx + 7, by + 12 + i * 15));
+    ctx.restore();
+  });
+}
+function wrap(text, max, most = 3) {
+  const out = [""];
+  for (const w of text.split(" ")) { const t = out[out.length - 1] ? out[out.length - 1] + " " + w : w; if (ctx.measureText(t).width > max && out[out.length - 1]) out.push(w); else out[out.length - 1] = t; }
+  return out.slice(0, most);
+}
+/** My order screen: what someone else must do, a draining timer, and the SHOUT button. */
+function drawCard(g, now) {
+  const R = L.card, o = myOrder(g), me = mySeat(g);
+  ctx.fillStyle = "#06081c"; rr(R.x, R.y, R.w, R.h, 14); ctx.fill();
+  ctx.strokeStyle = "#2a3170"; ctx.lineWidth = 3; rr(R.x, R.y, R.w, R.h, 14); ctx.stroke();
+  ctx.save(); rr(R.x, R.y, R.w, R.h, 14); ctx.clip();
+  for (let y = R.y; y < R.y + R.h; y += 4) { ctx.fillStyle = "#ffffff05"; ctx.fillRect(R.x, y, R.w, 1); } // scanlines
+  const bwid = Math.min(120, R.w * 0.3), text = R.w - bwid - 30;
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  let title = "", color = "#ffd23f", sub = "";
+  if (me < 0) { title = "Hang tight!"; sub = "You join the crew at the next sector."; color = "#9fa8ff"; }
+  else if (g.ph === "ready") { title = `Sector ${g.lvl}: learn your panel!`; sub = "Orders for YOUR controls show up on the others' screens."; color = "#3ec1ff"; }
+  else if (g.ph === "warp") { title = "WARP!"; sub = `Sector ${g.lvl} cleared. Hull patched up.`; color = "#c38bff"; }
+  else if (!o) { title = "…"; sub = "Incoming…"; color = "#5a63a8"; }
+  else if (o.done === 1) { title = "✓ FIXED!"; color = "#4bf08a"; sub = orderText(g, o); }
+  else if (o.done === -1) { title = "✗ TOO SLOW!"; color = "#ff4b4b"; sub = `Hull −${CONFIG.hullHit}%`; }
+  else { title = orderText(g, o); sub = `Someone else has the ${panels(g)[o.t][o.k].name}. Shout it!`; }
+  ctx.fillStyle = color; ctx.shadowColor = color; ctx.shadowBlur = 12;
+  let fs = Math.min(30, Math.max(17, R.h * 0.22)); ctx.font = `900 ${fs}px system-ui, sans-serif`;
+  let lines = wrap(title, o && !o.done && me >= 0 && g.ph === "play" ? text : R.w - 30);
+  while (lines.length > 2 && fs > 15) { fs -= 2; ctx.font = `900 ${fs}px system-ui, sans-serif`; lines = wrap(title, text); }
+  const ty = R.y + R.h * 0.4 - (lines.length - 1) * fs * 0.55;
+  lines.forEach((l, i) => ctx.fillText(l, R.x + 16, ty + i * fs * 1.1));
+  ctx.shadowBlur = 0; ctx.fillStyle = "#aab0d8"; ctx.font = "600 13px system-ui, sans-serif"; ctx.fillText(wrap(sub, R.w - 40)[0], R.x + 16, R.y + R.h - 28);
+  if (o && !o.done && g.ph === "play") { // the timer bar
+    const k = Math.max(0, Math.min(1, (o.endsAt - Date.now()) / (o.endsAt - o.at)));
+    ctx.fillStyle = "#1a1f4a"; ctx.fillRect(R.x, R.y + R.h - 8, R.w, 8);
+    ctx.fillStyle = k > 0.5 ? "#4bf08a" : k > 0.25 ? "#ffd23f" : Math.floor(now / 150) % 2 ? "#ff4b4b" : "#ffa0a0"; ctx.fillRect(R.x, R.y + R.h - 8, R.w * k, 8);
+    const bx = R.x + R.w - bwid - 12, by = R.y + 12, bh = Math.min(R.h - 34, 64), pulse = ease((now - shoutPulse) / 300);
+    ctx.fillStyle = "#ff4fa3"; rr(bx, by + (1 - pulse) * 3, bwid, bh, 12); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.font = "900 17px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.fillText("📣 SHOUT", bx + bwid / 2, by + bh / 2 + (1 - pulse) * 3);
+    HITS.push({ type: "shout", x: bx, y: by, w: bwid, h: bh });
+  }
+  ctx.restore();
+}
+/** My panel: one tile per control. */
+function drawPanel(g, now) {
+  const R = L.panel, s = mySeat(g);
+  ctx.fillStyle = "#151a44"; rr(R.x, R.y, R.w, R.h, 18); ctx.fill();
+  ctx.strokeStyle = "#2f3786"; ctx.lineWidth = 3; rr(R.x, R.y, R.w, R.h, 18); ctx.stroke();
+  for (const [a, b] of [[0.03, 0.03], [0.97, 0.03], [0.03, 0.97], [0.97, 0.97]]) { ctx.fillStyle = "#3a4290"; circle(R.x + R.w * a, R.y + R.h * b, 4); ctx.fill(); }
+  if (s < 0 || !myCtl) {
+    ctx.fillStyle = "#6a72b8"; ctx.font = "800 18px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(s < 0 ? "Your panel arrives next sector" : "Powering up…", R.x + R.w / 2, R.y + R.h / 2); return;
+  }
+  const P = panels(g)[s], n = P.length, cols = R.w > R.h * 1.1 ? 3 : 2, rows = Math.ceil(n / cols), gap = 10;
+  const tw = (R.w - gap * (cols + 1)) / cols, th = (R.h - gap * (rows + 1)) / rows;
+  P.forEach((c, k) => {
+    const x = R.x + gap + (k % cols) * (tw + gap), y = R.y + gap + Math.floor(k / cols) * (th + gap);
+    drawControl(c, myCtl.v[k] ?? 0, x, y, tw, th, now, s + ":" + k);
+    HITS.push({ type: "ctl", k, kind: c.kind, x, y, w: tw, h: th });
+  });
+}
+function drawControl(c, v, x, y, w, h, now, key) {
+  const pAge = now - (pressAt.get(key) ?? -1e9), hot = `hsl(${c.hue},90%,62%)`, fixAge = now - (fixAt.get(key) ?? -1e9);
+  ctx.fillStyle = "#222a63"; rr(x, y, w, h, 14); ctx.fill();
+  ctx.strokeStyle = fixAge < 600 ? "#4bf08a" : "#39418f"; ctx.lineWidth = fixAge < 600 ? 4 : 2; rr(x, y, w, h, 14); ctx.stroke();
+  ctx.fillStyle = "#9feaff"; ctx.font = `900 ${Math.round(Math.max(11, Math.min(15, w * 0.085)))}px system-ui, sans-serif`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(c.name.toUpperCase(), x + w / 2, y + 16);
+  const cx = x + w / 2, cy = y + 24 + (h - 24) / 2, sz = Math.min(w * 0.8, h - 40);
+  if (c.kind === "switch") {
+    const sw = Math.min(sz * 0.42, 54), sh = sz * 0.82;
+    ctx.fillStyle = "#0b0e2a"; rr(cx - sw / 2, cy - sh / 2, sw, sh, sw / 2); ctx.fill();
+    const k = ease(pAge / 160), ly = v ? cy - sh * 0.22 : cy + sh * 0.22;
+    ctx.fillStyle = v ? hot : "#5b6290"; circle(cx, ly, sw * 0.42 * (0.9 + 0.1 * k)); ctx.fill();
+    ctx.fillStyle = v ? "#4bf08a" : "#3a2030"; circle(cx + sw * 0.9, cy - sh * 0.38, 5); ctx.fill();
+    ctx.fillStyle = "#dfe3ff"; ctx.font = "800 12px system-ui, sans-serif"; ctx.fillText("ON", cx - sw * 0.95, cy - sh * 0.22); ctx.fillText("OFF", cx - sw * 1.05, cy + sh * 0.22);
+  } else if (c.kind === "dial") {
+    const r = Math.min(sz * 0.36, 56), max = KINDS.dial.max;
+    for (let i = 0; i <= max; i++) { const a = Math.PI * (0.75 + (1.5 * i) / max); ctx.fillStyle = i === v ? hot : "#7a82c0"; ctx.font = "800 13px system-ui"; ctx.fillText(i, cx + Math.cos(a) * (r + 14), cy + Math.sin(a) * (r + 14)); }
+    ctx.fillStyle = "#0b0e2a"; circle(cx, cy, r); ctx.fill();
+    ctx.fillStyle = "#3a4290"; circle(cx, cy, r * 0.82); ctx.fill();
+    const a = Math.PI * (0.75 + (1.5 * v) / max);
+    ctx.strokeStyle = hot; ctx.lineWidth = 5; ctx.lineCap = "round"; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.cos(a) * r * 0.72, cy + Math.sin(a) * r * 0.72); ctx.stroke();
+    ctx.fillStyle = "#dfe3ff"; circle(cx, cy, r * 0.16); ctx.fill();
+  } else if (c.kind === "slider") {
+    const max = KINDS.slider.max, th = sz * 0.88, top = cy - th / 2;
+    ctx.fillStyle = "#0b0e2a"; rr(cx - 7, top, 14, th, 7); ctx.fill();
+    for (let i = 0; i <= max; i++) { const yy = top + th - (th * i) / max; ctx.fillStyle = i === v ? hot : "#7a82c0"; ctx.font = "800 12px system-ui"; ctx.fillText(i, cx - 30, yy); ctx.fillRect(cx + 12, yy - 1, 10, 2); }
+    const hy = top + th - (th * v) / max;
+    ctx.fillStyle = hot; rr(cx - 22, hy - 10, 44, 20, 6); ctx.fill(); ctx.fillStyle = "#fff6"; ctx.fillRect(cx - 16, hy - 1, 32, 2);
+  } else if (c.kind === "button") {
+    const r = Math.min(sz * 0.34, 54), dn = pAge < 140 ? 4 : 0;
+    ctx.fillStyle = "#0b0e2a"; circle(cx, cy + 5, r * 1.12); ctx.fill();
+    ctx.fillStyle = `hsl(${c.hue},70%,35%)`; circle(cx, cy + 5, r); ctx.fill();
+    ctx.fillStyle = hot; circle(cx, cy + dn, r); ctx.fill();
+    ctx.fillStyle = "#ffffff40"; ctx.beginPath(); ctx.ellipse(cx - r * 0.3, cy + dn - r * 0.35, r * 0.35, r * 0.18, -0.5, 0, 7); ctx.fill();
+    ctx.fillStyle = "#0b0e2a"; ctx.font = "900 13px system-ui"; ctx.fillText("PUSH", cx, cy + dn);
+  }
+}
+function burst(x, y, colors, n, speed = 220) { for (let i = 0; i < n; i++) { const a = Math.random() * Math.PI * 2, v = rnd(40, speed); parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 50, life: 1, color: pick(colors), r: rnd(2, 4.5) }); } }
+function drawParticles(dt) {
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.life -= dt * 1.1; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 300 * dt;
+    if (p.life <= 0) { parts.splice(i, 1); continue; }
+    ctx.globalAlpha = Math.min(1, p.life * 1.5); ctx.fillStyle = p.color; circle(p.x, p.y, p.r * (0.4 + p.life * 0.6)); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function draw(g, now, dt) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const bg = ctx.createLinearGradient(0, 0, 0, H); bg.addColorStop(0, "#0b0e2a"); bg.addColorStop(1, "#141640"); ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+  HITS = [];
+  warpK += ((g && g.ph === "warp" ? 1 : 0) - warpK) * Math.min(1, dt * 2.5);
+  ctx.save(); if (now < shakeUntil) ctx.translate(Math.sin(now / 19) * 6, Math.cos(now / 23) * 4);
+  drawWindow(g, now, dt);
+  if (g) { drawTop(g, now); drawCrew(g, now); drawCard(g, now); drawPanel(g, now); }
+  ctx.restore();
+  drawParticles(dt);
+  if (now < flashUntil) { ctx.globalAlpha = Math.min(0.45, (flashUntil - now) / 700); ctx.fillStyle = flashColor; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
+  if (g && g.ph === "warp") { ctx.fillStyle = `rgba(195,139,255,${0.12 * warpK})`; ctx.fillRect(0, 0, W, H); }
+}
+
+// ── SCREENS ─────────────────────────────────────────────────────────────────────────
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const secs = (ms) => Math.max(0, Math.ceil(ms / 1000));
+let AC = null;
+function unlockAudio() { if (!AC && !ATTRACT) try { AC = new AudioContext(); } catch {} }
+function tone(f, ms, type = "sine", vol = 0.05, f2 = 0) {
+  if (!AC) return;
+  const o = AC.createOscillator(), gn = AC.createGain(), t = AC.currentTime;
+  o.type = type; o.frequency.setValueAtTime(f, t); if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + ms / 1000);
+  gn.gain.setValueAtTime(vol, t); gn.gain.exponentialRampToValueAtTime(0.0001, t + ms / 1000);
+  o.connect(gn).connect(AC.destination); o.start(t); o.stop(t + ms / 1000);
+}
+/** Sounds, sparks and shakes for what just changed in state (effects only: nothing here decides anything). */
+const seen = { phase: "", orders: new Map(), shouts: -1, first: true };
+const fixAt = new Map();
+function effects(g, now) {
+  const key = g.id + ":" + g.lvl + ":" + g.ph;
+  if (key !== seen.phase) {
+    if (!seen.first) {
+      if (g.ph === "warp") { [392, 523, 659, 784, 1047].forEach((f, i) => setTimeout(() => tone(f, 200, "triangle", 0.06), i * 90)); burst(W / 2, L.win.y + L.win.h / 2, ["#c38bff", "#3ec1ff", "#fff"], 70, 420); }
+      if (g.ph === "over") { tone(90, 1200, "sawtooth", 0.1, 40); shakeUntil = now + 900; flashUntil = now + 900; flashColor = "#ff2a2a"; }
+      if (g.ph === "play") tone(660, 150, "square", 0.04);
+    }
+    seen.phase = key;
+  }
+  for (const o of g.orders) {
+    const was = seen.orders.get(o.id);
+    if (was === o.done) continue;
+    seen.orders.set(o.id, o.done);
+    if (was === undefined && seen.first) continue;
+    const s = mySeat(g), ckey = o.t + ":" + o.k;
+    if (o.done === 1) {
+      fixAt.set(ckey, now);
+      if (o.s === s || o.t === s) { tone(880, 90, "triangle", 0.06); setTimeout(() => tone(1320, 140, "triangle", 0.06), 80); }
+      const R = o.s === s ? L.card : L.top; burst(R.x + R.w * 0.3, R.y + R.h / 2, ["#4bf08a", "#ffd23f", "#fff"], o.s === s ? 26 : 8, 200);
+    }
+    if (o.done === -1) { shakeUntil = now + 450; flashUntil = now + 450; flashColor = "#ff2a2a"; tone(140, 380, "sawtooth", 0.08, 70); burst(Math.random() * W, L.win.y + L.win.h, ["#ffa94d", "#ff4b4b", "#ffd23f"], 30, 300); }
+  }
+  if (seen.orders.size > 200) seen.orders = new Map([...seen.orders].slice(-60));
+  const sh = shared("shouts", null);
+  if (sh && sh.c !== seen.shouts) {
+    const fresh = seen.shouts < 0 ? 0 : Math.min(sh.l.length, sh.c - seen.shouts);
+    for (const [s, text] of sh.l.slice(sh.l.length - fresh)) { bubbles.set(s, { text, at: now, mine: mineToDo(g, text) }); tone(600 + s * 80, 60, "square", 0.025); }
+    seen.shouts = sh.c;
+  }
+  seen.first = false;
+}
+/** Is a shouted order for one of MY controls? (Then its bubble is yellow.) */
+function mineToDo(g, text) { const s = mySeat(g); return s >= 0 && panels(g)[s].some((c) => text.includes(c.name)); }
+
+function hud(g) {
+  const n = humans().length;
+  $("net").textContent = ATTRACT ? "" : net.offline ? "Offline: playing with bots" : dropped ? "Reconnecting…" : `Online · ${n} player${n === 1 ? "" : "s"}${isHost() ? " · you run the ship" : ""}`;
+  if (g) renderOver(g);
+}
+let overFor = -1, board = null;
+function renderOver(g) {
+  $("over").hidden = g.ph !== "over" || ATTRACT;
+  if (g.ph !== "over") return;
+  $("oWhy").textContent = g.last ? `The last straw: "${g.last}"` : "The hull gave out.";
+  $("oNext").textContent = `Next flight in ${secs(g.endsAt - Date.now())}s`;
+  $("again").textContent = g.ready.includes(net.sessionId) ? "Ready ✓" : "Play again";
+  if (overFor === g.id) return;
+  overFor = g.id;
+  $("oYou").textContent = `Your crew fixed ${g.score} thing${g.score === 1 ? "" : "s"} and reached sector ${g.lvl}.`;
+  const list = $("board");
+  if (!board) { list.innerHTML = "<li>Leaderboards need a connection.</li>"; return; }
+  list.innerHTML = "<li>Loading the leaderboard…</li>";
+  (g.score > 0 && mySeat(g) >= 0 ? board.submit(g.score).catch(() => null) : Promise.resolve()).then(() => board.top(10)).then(({ entries }) => {
+    list.innerHTML = entries.length ? entries.map((e) => `<li>${esc(e.username || "Player")}<span>${e.score}</span></li>`).join("") : "<li>No flights yet. Be the first.</li>";
+  }).catch(() => { list.innerHTML = "<li>Couldn't load the leaderboard.</li>"; });
+}
+/** Two players picked one color (they joined at once), or a bot has mine: pick a free one (the later sessionId moves). */
+function fixColor() {
+  const g = game(), others = Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId);
+  const botColors = g ? g.crew.filter((c) => c.b).map((c) => c.c) : [];
+  if (!others.some(([id, p]) => p.c === myColor && id < net.sessionId) && !botColors.includes(myColor)) return;
+  const taken = new Set([...others.map(([, p]) => p.c), ...botColors]), free = COLORS.find((c) => !taken.has(c));
+  if (free) { myColor = free; net.me.set("c", free); }
+}
+
+// ── INPUT ───────────────────────────────────────────────────────────────────────────
+let dragK = -1;
+const hitAt = (x, y) => HITS.find((h) => x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h);
+/** Where on a slider tile the pointer is, as a value 0..max. */
+function sliderValue(h, y) { const sz = Math.min(h.w * 0.8, h.h - 40), th = sz * 0.88, cy = h.y + 24 + (h.h - 24) / 2, top = cy - th / 2; return Math.max(0, Math.min(KINDS.slider.max, Math.round(((top + th - y) / th) * KINDS.slider.max))); }
+cv.addEventListener("pointerdown", (e) => {
+  e.preventDefault(); unlockAudio();
+  if (ATTRACT || document.activeElement === $("name")) { $("name").blur(); }
+  const h = hitAt(e.clientX, e.clientY);
+  if (!h || ATTRACT) return;
+  if (h.type === "shout") return shoutMine();
+  const v = myCtl ? myCtl.v[h.k] ?? 0 : 0;
+  if (h.kind === "switch") setControl(h.k, v ? 0 : 1);
+  if (h.kind === "dial") setControl(h.k, (v + 1) % (KINDS.dial.max + 1));
+  if (h.kind === "button") { setControl(h.k, v + 1); const x = h.x + h.w / 2, y = h.y + h.h / 2 + 12; burst(x, y, ["#fff", "#ffd23f"], 8, 120); }
+  if (h.kind === "slider") { dragK = h.k; cv.setPointerCapture(e.pointerId); setControl(h.k, sliderValue(h, e.clientY)); }
+});
+cv.addEventListener("pointermove", (e) => {
+  if (dragK < 0) { const h = hitAt(e.clientX, e.clientY); cv.style.cursor = h ? "pointer" : "default"; return; }
+  const h = HITS.find((x) => x.type === "ctl" && x.k === dragK);
+  if (h) setControl(dragK, sliderValue(h, e.clientY));
+});
+const endDrag = () => { dragK = -1; };
+cv.addEventListener("pointerup", endDrag); cv.addEventListener("pointercancel", endDrag);
+$("again").addEventListener("click", () => toHost("ready", { r: 1 }));
+$("name").addEventListener("change", () => {
+  myName = $("name").value.trim().slice(0, 14) || myName;
+  try { localStorage.setItem("mpa-name", myName); } catch {}
+  net && net.me.set("n", myName);
+});
+addEventListener("keydown", (e) => {
+  unlockAudio();
+  if (document.activeElement === $("name")) { if (e.key === "Enter") $("name").blur(); return; }
+  if (e.code === "Space") { e.preventDefault(); shoutMine(); }
+});
+
+// ── MAIN LOOP ───────────────────────────────────────────────────────────────────────
+let last = performance.now(), lastHb = 0, lastHud = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  const t0 = performance.now(); // not `now`: the first frame after a freeze can be stamped from before it ended
+  if (frameAt && t0 - frameAt > 1000) { wokeAt = t0; host.was = false; host.last = null; } // woke from a stall: drop my host copy, adopt state again (see isHost)
+  frameAt = t0;
+  const dt = Math.max(0, Math.min(0.05, (now - last) / 1000)); last = now;
+  if (now - lastHb > 1000) { lastHb = now; net.me.set("hb", Date.now()); fixColor(); }
+  if (isHost()) hostTick(); else host.was = false;
+  const g = game();
+  if (g) { syncMyPanel(g); effects(g, now); autopilot(g, now); }
+  draw(g, now, dt);
+  if (now - lastHud > 150) { lastHud = now; hud(g); }
+}
+
+(async function start() {
+  if (ATTRACT) Object.assign(CONFIG, { readyMs: 900, orderMs: 5200, minOrderMs: 4200, needBase: 14, warpMs: 2600, overMs: 3000, nextOrderMs: [150, 600],
+    botShoutMs: [250, 700], botHeardMs: [700, 1800], botUnheardMs: [2500, 6000], botMiss: 0.22, botFiddle: 0.6 });
+  fit();
+  net = await connect();
+  net.onState((st) => { S = st; });
+  net.onDisconnect(() => { dropped = true; $("net").textContent = "Reconnecting…"; });
+  net.onReconnect(() => { dropped = false; });
+  for (const [type, fn] of Object.entries(HANDLERS)) net.on(type, (msg, from) => { if (isHost() && msg) fn(from, msg); });
+  if (!net.offline && typeof MP !== "undefined") board = MP.auth({ key: MP_CONNECT.key, apiUrl: MP_CONNECT.apiUrl }).leaderboard(CONFIG.board);
+  const g = game(), taken = new Set([...Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId).map(([, p]) => p.c), ...(g ? g.crew.filter((c) => c.b).map((c) => c.c) : [])]);
+  myColor = COLORS.find((c) => !taken.has(c)) || COLORS[Math.floor(Math.random() * COLORS.length)];
+  $("name").value = myName;
+  net.me.set({ n: myName, c: myColor, hb: Date.now() });
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

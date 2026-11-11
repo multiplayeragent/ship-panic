@@ -1,0 +1,21 @@
+{
+  "name": "Ship Panic",
+  "genre": "party",
+  "dim": "2D",
+  "mode": "Co-op",
+  "players": "2–6",
+  "hook": "Shout the orders. Flip the switches. Don't explode.",
+  "how": "Your screen shows orders for someone else's panel: shout them out. Their screens show orders for yours. Fix enough in time to warp to the next sector; every miss cracks the hull, and each sector is faster.",
+  "controls": "Click or tap switches, dials and buttons, drag sliders; SHOUT (or Space) reads your order to the crew",
+  "uses": [
+    ["Host-run rules", "The host's browser makes every order, sends it to someone else's screen and checks the panels; if it leaves, the next player takes over."],
+    ["Bots", "Bots fill empty seats: they shout their orders and work their own panels, a little slowly."],
+    ["Live sync", "Every switch you flip shows up for the crew at once."],
+    ["Leaderboard", "The most orders your crew fixed in one flight."]
+  ],
+  "ideas": [
+    "Add a meteor shower that shakes everyone's screen",
+    "Make it a submarine instead of a spaceship",
+    "Add a control that has to be held down"
+  ]
+}
