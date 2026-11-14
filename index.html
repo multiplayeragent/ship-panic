@@ -17,6 +17,7 @@
   .card h2 { margin: 0; font-size: 28px; color: #ff6b6b; } .card h3 { margin: 4px 0 0; font-size: 13px; color: #ffd23f; text-align: left; }
   #oWhy, #oNext { color: #aab0d8; } #oYou { color: #ffd23f; font-weight: 700; }
   #board { text-align: left; margin: 2px 0; padding-left: 26px; font-size: 14px; min-height: 30px; } #board li span { float: right; }
+  #board li.note { list-style: none; margin-left: -26px; color: #aab0d8; } /* a message in place of the list: no "1." in front of it */
   .go { min-height: 46px; border: 0; border-radius: 12px; background: #ffd23f; color: #2a1d00; font: 800 16px system-ui, sans-serif; cursor: pointer; }
 </style>
 <script src="https://cdn.multiplayeragent.com/sdk/mp.global.js"></script>
@@ -27,7 +28,7 @@
 <div class="hud" id="net">Connecting…</div>
 <div class="over" id="over" hidden><div class="card">
   <h2>The ship fell apart!</h2><div id="oWhy"></div><div id="oYou"></div>
-  <h3>Most fixes in one flight</h3><ol id="board"><li>Loading…</li></ol>
+  <h3>Most fixes in one flight</h3><ol id="board"><li class="note">Loading…</li></ol>
   <button class="go" id="again">Play again</button><div id="oNext"></div>
 </div></div>
 <script>
@@ -492,7 +493,8 @@ function drawTop(g, now) {
   ctx.fillStyle = "#1a1f4a"; rr(R.x, R.y + 22, hw, 16, 8); ctx.fill();
   const hc = g.hull > 60 ? "#4bf08a" : g.hull > 30 ? "#ffd23f" : "#ff4b4b";
   ctx.fillStyle = lowHull ? "#ffffff" : hc; rr(R.x, R.y + 22, Math.max(8, (hw * g.hull) / 100), 16, 8); ctx.fill();
-  ctx.fillStyle = "#0b0e2a"; ctx.font = "900 11px system-ui, sans-serif"; ctx.fillText(Math.round(g.hull) + "%", R.x + 8, R.y + 30.5);
+  const label = (hw * g.hull) / 100 > 44; // the % sits on the bar when it's wide enough, else just past it, in white
+  ctx.fillStyle = label ? "#0b0e2a" : "#ffffff"; ctx.font = "900 11px system-ui, sans-serif"; ctx.fillText(Math.round(g.hull) + "%", label ? R.x + 8 : R.x + Math.max(8, (hw * g.hull) / 100) + 6, R.y + 30.5);
   const px = R.x + hw + 16, pw = Math.max(60, R.w - hw - 16);
   ctx.fillStyle = "#9fa8ff"; ctx.font = "800 12px system-ui, sans-serif"; ctx.fillText(`SECTOR ${g.lvl} · ${Math.min(g.prog, g.need)}/${g.need}`, px, R.y + 12);
   ctx.fillStyle = "#1a1f4a"; rr(px, R.y + 22, pw, 16, 8); ctx.fill();
@@ -685,7 +687,7 @@ function effects(g, now) {
       if (o.s === s || o.t === s) { tone(880, 90, "triangle", 0.06); setTimeout(() => tone(1320, 140, "triangle", 0.06), 80); }
       const R = o.s === s ? L.card : L.top; burst(R.x + R.w * 0.3, R.y + R.h / 2, ["#4bf08a", "#ffd23f", "#fff"], o.s === s ? 26 : 8, 200);
     }
-    if (o.done === -1) { shakeUntil = now + 450; flashUntil = now + 450; flashColor = "#ff2a2a"; tone(140, 380, "sawtooth", 0.08, 70); burst(Math.random() * W, L.win.y + L.win.h, ["#ffa94d", "#ff4b4b", "#ffd23f"], 30, 300); }
+    if (o.done === -1) { shakeUntil = now + 450; flashUntil = now + 450; flashColor = "#ff2a2a"; tone(140, 380, "sawtooth", 0.08, 70); burst(L.win.x + Math.random() * L.win.w, L.win.y + L.win.h, ["#ffa94d", "#ff4b4b", "#ffd23f"], 30, 300); }
   }
   if (seen.orders.size > 200) seen.orders = new Map([...seen.orders].slice(-60));
   const sh = shared("shouts", null);
@@ -715,11 +717,11 @@ function renderOver(g) {
   overFor = g.id;
   $("oYou").textContent = `Your crew fixed ${g.score} thing${g.score === 1 ? "" : "s"} and reached sector ${g.lvl}.`;
   const list = $("board");
-  if (!board) { list.innerHTML = "<li>Leaderboards need a connection.</li>"; return; }
-  list.innerHTML = "<li>Loading the leaderboard…</li>";
+  if (!board) { list.innerHTML = '<li class="note">Leaderboards need a connection.</li>'; return; }
+  list.innerHTML = '<li class="note">Loading the leaderboard…</li>';
   (g.score > 0 && mySeat(g) >= 0 ? board.submit(g.score).catch(() => null) : Promise.resolve()).then(() => board.top(10)).then(({ entries }) => {
-    list.innerHTML = entries.length ? entries.map((e) => `<li>${esc(e.username || "Player")}<span>${e.score}</span></li>`).join("") : "<li>No flights yet. Be the first.</li>";
-  }).catch(() => { list.innerHTML = "<li>Couldn't load the leaderboard.</li>"; });
+    list.innerHTML = entries.length ? entries.map((e) => `<li>${esc(e.username || "Player")}<span>${e.score}</span></li>`).join("") : '<li class="note">No flights yet. Be the first.</li>';
+  }).catch(() => { list.innerHTML = `<li class="note">Couldn't load the leaderboard.</li>`; });
 }
 /** Two players picked one color (they joined at once), or a bot has mine: pick a free one (the later sessionId moves). */
 function fixColor() {
@@ -735,8 +737,10 @@ let dragK = -1;
 const hitAt = (x, y) => HITS.find((h) => x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h);
 /** Where on a slider tile the pointer is, as a value 0..max. */
 function sliderValue(h, y) { const sz = Math.min(h.w * 0.8, h.h - 40), th = sz * 0.88, cy = h.y + 24 + (h.h - 24) / 2, top = cy - th / 2; return Math.max(0, Math.min(KINDS.slider.max, Math.round(((top + th - y) / th) * KINDS.slider.max))); }
+cv.addEventListener("contextmenu", (e) => e.preventDefault()); // no browser menu over the panel
 cv.addEventListener("pointerdown", (e) => {
   e.preventDefault(); unlockAudio();
+  if (e.button !== 0) return; // the main button or a finger only
   if (ATTRACT || document.activeElement === $("name")) { $("name").blur(); }
   const h = hitAt(e.clientX, e.clientY);
   if (!h || ATTRACT) return;
