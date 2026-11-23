@@ -319,6 +319,8 @@ function seatChanges(g) {
 function adopt() {
   host.was = true; host.last = null; host.plans = new Map(); host.seen = new Map();
   host.shouts = shared("shouts", null) || { c: 0, l: [] };
+  const g = game(); // orders shouted before I took over: the bots still heard them, and don't shout them again
+  if (g) for (const [, , id] of host.shouts.l) { const o = g.orders.find((x) => x.id === id && !x.done); if (o) { host.plans.set("shout" + o.id, 0); if (g.crew[o.t]?.b) heard(o, true); } }
 }
 /** Read an order out loud to the crew: it shows as a speech bubble over the seat that shouted. */
 function onShout(from, msg) {
